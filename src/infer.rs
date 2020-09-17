@@ -99,13 +99,6 @@ pub enum Constraint<'a> {
         span: Span<'a>,
         ctx: Option<Rc<ConstraintCtx<'a>>>,
     },
-
-    // For re-fetching type info for nodes once inference is done
-    NodeType {
-        node: AstNodeID,
-        ty: Type<'a>,
-        span: Span<'a>,
-    },
 }
 
 impl<'a> Type<'a> {
@@ -153,7 +146,7 @@ impl<'a> Type<'a> {
         };
     }
 
-    fn generalize(&self, ctx: &mut InferContext) -> Self {
+    fn generalize(&self, ctx: &mut InferContext<'a>) -> Self {
         let free_vars = self.free_vars();
         // let mut quant = Vec::with_capacity(free_vars.len());
 
@@ -169,7 +162,7 @@ impl<'a> Type<'a> {
                      Box::new(self.clone()))
     }
 
-    fn instantiate(&self, ctx: &mut InferContext, span: &Span<'a>)
+    fn instantiate(&self, ctx: &mut InferContext<'a>, span: &Span<'a>)
         -> Result<Self> {
         if let Self::Scheme(quant, ty) = self {
             let subst = quant.iter().map(|q|
@@ -200,7 +193,7 @@ impl<'a> fmt::Display for Type<'a> {
                     TypeIdent::Unit => write!(f, "NIL")?,
                 }
 
-                if (args.len() == 0) {
+                if args.len() == 0 {
                     return Ok(());
                 }
 
@@ -233,8 +226,6 @@ impl<'a> fmt::Display for Constraint<'a> {
         match self {
             Constraint::Eq { a, b, .. } =>
                 write!(f, "eq: {} = {}", a, b),
-            Constraint::NodeType { node, ty, .. } =>
-                write!(f, "ast: {} => {}", node, ty),
         }
     }
 }
@@ -254,15 +245,9 @@ impl<'a> Constraint<'a> {
         }
     }
 
-    fn new_nodety(
-        nodeid: AstNodeID, ty: Type<'a>, span: Span<'a>
-    ) -> Self {
-        Self::NodeType { node: nodeid, ty, span }
-    }
-
     pub fn span(&self) -> &Span<'a> {
         match self {
-            Self::Eq { span, .. } | Self::NodeType { span, .. } => span,
+            Self::Eq { span, .. } => span,
         }
     }
 
@@ -272,21 +257,20 @@ impl<'a> Constraint<'a> {
                 a.substitute(subst);
                 b.substitute(subst);
             },
-
-            Self::NodeType { ty, .. } =>
-                ty.substitute(subst),
         };
     }
 }
 
-struct InferContext {
+struct InferContext<'a> {
     next_type_var_id: usize,
+    ast_types: Vec<(AstNodeID, (Type<'a>, Span<'a>))>,
 }
 
-impl InferContext {
+impl<'a> InferContext<'a> {
     fn new() -> Self {
         Self {
             next_type_var_id: 0,
+            ast_types: Vec::with_capacity(100),
         }
     }
 
@@ -294,6 +278,14 @@ impl InferContext {
         let r = self.next_type_var_id;
         self.next_type_var_id += 1;
         TypeVar(r)
+    }
+
+    fn bind_ast_type(&mut self, id: AstNodeID, ty: (Type<'a>, Span<'a>)) {
+        self.ast_types.push((id, ty));
+    }
+
+    fn substitute_ast_types(&mut self, subst: &IndexMap<TypeVar, Type<'a>>) {
+        self.ast_types.iter_mut().for_each(|(_id, (ty, _span))| ty.substitute(&subst));
     }
 }
 
@@ -405,11 +397,7 @@ macro_rules! Constraint {
     (eq: $a:expr, $b:expr, $s:expr, $c:expr) => {
         Constraint::new_eq($a.into(), $b.into(), $s, $c)
     };
-    (ast: $a:expr, $b:expr, $s:expr) => {
-        Constraint::new_nodety($a, $b.into(), $s)
-    };
 }
-
 
 #[enum_dispatch(Expr)]
 trait GenConstraints<'a> {
@@ -417,7 +405,7 @@ trait GenConstraints<'a> {
         &self,
         targ: TypeVar,
         cons: &mut Vec<Constraint<'a>>,
-        ctx: &mut InferContext,
+        ctx: &mut InferContext<'a>,
         scp: &mut Scope<'a>,
     ) -> Result<()>;
 }
@@ -438,7 +426,7 @@ macro_rules! GenConstraints {
                 &self,
                 $targ: TypeVar,
                 $cons: &mut Vec<Constraint<'a>>,
-                $ctx: &mut InferContext,
+                $ctx: &mut InferContext<'a>,
                 $scp: &mut Scope<'a>,
             ) -> Result<()> {
                 let $this = self;
@@ -484,22 +472,22 @@ macro_rules! GenConstraints {
 GenConstraints!(for Ident(_this, _targ, _cons, _ctx, _scp) = unimplemented!());
 GenConstraints!(for Stmt(_this, _targ, _cons, _ctx, _scp) = unimplemented!());
 
-GenConstraints!(for VarRef(this, targ, cons, _ctx, scp) = {
-    cons.push(Constraint!(ast: this.get_id(), targ, this.span()));
+GenConstraints!(for VarRef(this, targ, cons, ctx, scp) = {
+    ctx.bind_ast_type(this.get_id(), (targ.into(), this.span()));
     cons.push(
         Constraint!(
             eq: targ, scp.try_get(&this.name)?.clone(), this.span()));
     Ok(())
 });
 
-GenConstraints!(for IntLit(this, targ, cons, _ctx, _scp) = {
-    cons.push(Constraint!(ast: this.get_id(), targ, this.span()));
+GenConstraints!(for IntLit(this, targ, cons, ctx, _scp) = {
+    ctx.bind_ast_type(this.get_id(), (targ.into(), this.span()));
     cons.push(Constraint!(eq: targ, Type!(Integer()), this.span()));
     Ok(())
 });
 
-GenConstraints!(for StrLit(this, targ, cons, _ctx, _scp) = {
-    cons.push(Constraint!(ast: this.get_id(), targ, this.span()));
+GenConstraints!(for StrLit(this, targ, cons, ctx, _scp) = {
+    ctx.bind_ast_type(this.get_id(), (targ.into(), this.span()));
     cons.push(Constraint!(eq: targ, Type!(String()), this.span()));
     Ok(())
 });
@@ -526,7 +514,7 @@ GenConstraints!(for Block(this, targ, cons, ctx, scp) = {
         } else {
             cons.push(Constraint!(eq: targ, Type!(Unit()), this.span()));
         }
-        cons.push(Constraint!(ast: this.get_id(), targ, this.span()));
+        ctx.bind_ast_type(this.get_id(), (targ.into(), this.span()));
 
     });
 
@@ -552,7 +540,7 @@ GenConstraints!(for FunCal(this, targ, cons, ctx, scp) = {
         fty_a.clone()
     };
 
-    cons.push(Constraint!(ast: this.get_id(), targ, this.span()));
+    ctx.bind_ast_type(this.get_id(), (targ.into(), this.span()));
     cons.push(Constraint!(eq: fty_a, fty_b,
                           this.span(),
                           Some(Rc::new(ConstraintCtx::FunCal{
@@ -566,7 +554,7 @@ impl<'a> FunDef<'a> {
     fn gen_constraints(
         self: &Rc<Self>,
         cons: &mut Vec<Constraint<'a>>,
-        ctx: &mut InferContext,
+        ctx: &mut InferContext<'a>,
         scp: &mut Scope<'a>,
     ) -> Result<Type<'a>> {
 
@@ -597,7 +585,7 @@ impl<'a, 'f> FunDefGroup<'a, 'f> {
     fn gen_constraints(
         &self,
         cons: &mut Vec<Constraint<'a>>,
-        ctx: &mut InferContext,
+        ctx: &mut InferContext<'a>,
         scp: &mut Scope<'a>,
     ) -> Result<()> {
         // TODO: detect situations that fall under limitations of type
@@ -619,6 +607,7 @@ impl<'a, 'f> FunDefGroup<'a, 'f> {
             }
 
             let subst = unify(cons.clone())?;
+            ctx.substitute_ast_types(&subst);
             substitute_constraints(cons, &subst);
             subscp.substitute(&subst);
 
@@ -633,6 +622,7 @@ impl<'a, 'f> FunDefGroup<'a, 'f> {
             }
 
             let subst = unify(cons.clone())?;
+            ctx.substitute_ast_types(&subst);
             substitute_constraints(cons, &subst);
             subscp.substitute(&subst);
 
@@ -640,8 +630,9 @@ impl<'a, 'f> FunDefGroup<'a, 'f> {
                 fty.substitute(&subst);
                 *fty = fty.generalize(ctx);
 
-                cons.push(Constraint!(ast: IAstNode::get_id(*fundef),
-                                      fty.clone(), fundef.span()));
+
+                ctx.bind_ast_type(IAstNode::get_id(*fundef),
+                                  (fty.clone(), fundef.span()));
             }
 
         });
@@ -656,11 +647,11 @@ impl<'a, 'f> FunDefGroup<'a, 'f> {
 
 impl<'a> Module<'a> {
     pub fn gen_constraints(&self, symbols: &Symbols<'a>)
-        -> Result<Vec<Constraint<'a>>> {
+        -> Result<IndexMap<AstNodeID, (Type<'a>, Span<'a>)>> {
 
         let mut ctx = InferContext::new();
         let mut scp = Scope::new();
-        let mut r: Vec<Constraint<'a>> =
+        let mut cons: Vec<Constraint<'a>> =
             Vec::with_capacity(self.toplvls.len() * 50);
 
         let fundefs = 
@@ -672,15 +663,23 @@ impl<'a> Module<'a> {
             for fd in group.iter() {
                 println!("\t{} :\t{}", fd.name.path, fd.span().fragment());
             }
-            FunDefGroup(group).gen_constraints(&mut r, &mut ctx, &mut scp)?;
+            FunDefGroup(group).gen_constraints(&mut cons, &mut ctx, &mut scp)?;
         }
 
         // TODO: inference on other ast toplvls (typedefs/structdefs)
 
-        let subst = unify(r.clone())?;
-        substitute_constraints(&mut r, &subst);
+        let subst = unify(cons.clone())?;
+        ctx.substitute_ast_types(&subst);
+        // substitute_constraints(&mut cons, &subst);
+        // scp.substitute(&subst);
 
-        Ok(r)
+        let mut ast_types = IndexMap::with_capacity(ctx.ast_types.len());
+        for (id, ty) in ctx.ast_types.into_iter() {
+            if let Some(_) = ast_types.insert(id, ty) {
+                panic!("attempt to bind already existing ast node type.");
+            }
+        }
+        Ok(ast_types)
     }
 }
 
@@ -691,7 +690,6 @@ fn substitute_constraints<'a>(
     cons.iter_mut().for_each(|c| c.substitute(&subst));
     cons.retain(|con| match con {
         Constraint::Eq{a, b, ..} => a != b,
-        Constraint::NodeType{..} => true,
     });
 }
 
@@ -788,8 +786,6 @@ fn unify<'a>(
                     },
                 }
             },
-
-            Constraint::NodeType{..} => (),
         }
 
         i += 1;

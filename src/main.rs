@@ -47,11 +47,11 @@ a(x) = { a(1); a(x); x };
         println!("\t{}", path);
     }
 
-    let cons = module.gen_constraints(&symbols)
+    let types = module.gen_constraints(&symbols)
         .context("Failed to infer type constraints")?;
 
-    for c in cons {
-        println!("{}", c.span().format_note_at_pos(&format!("{}", c), true)?);
+    for (_nodeid, (ty, span)) in types {
+        println!("{}", span.format_note_at_pos(&format!("{}", ty), true)?);
     }
 
     Ok(())
