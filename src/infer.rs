@@ -883,7 +883,9 @@ impl<'a> FormatAtPos for Span<'a> {
     fn format_err_at_pos(&self, msg: &str, underline: bool) -> Result<String> {
         format_at_pos(
             self,
-            &format!("{} {}", Paint::red("error:").bold(), msg),
+            &Paint::red("error: ").bold().to_string(),
+            7,
+            msg,
             self.extra,
             underline,
         )
@@ -892,7 +894,9 @@ impl<'a> FormatAtPos for Span<'a> {
     fn format_note_at_pos(&self, msg: &str, underline: bool) -> Result<String> {
         format_at_pos(
             self,
-            &format!("{} {}", Paint::yellow("note:").bold(), msg),
+            &Paint::yellow("note: ").bold().to_string(),
+            6,
+            msg,
             self.extra,
             underline,
         )

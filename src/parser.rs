@@ -68,7 +68,9 @@ impl<'a, 's> FormatAtPos<'a, 's> for Span<'a> {
     ) -> Result<String> {
         format_at_pos(
             self,
-            &format!("{} {}", Paint::red("error:").bold(), msg),
+            &Paint::red("error: ").bold().to_string(),
+            7,
+            msg,
             ctx.file,
             underline,
         )
@@ -82,7 +84,9 @@ impl<'a, 's> FormatAtPos<'a, 's> for Span<'a> {
     ) -> Result<String> {
         format_at_pos(
             self,
-            &format!("{} {}", Paint::yellow("note:").bold(), msg),
+            &Paint::yellow("note: ").bold().to_string(),
+            6,
+            msg,
             ctx.file,
             underline,
         )
@@ -417,8 +421,7 @@ Parser!(for Block(ctx) = map!(tok!(get_span!(braces!(do_parse!(
     ret: opt!(map!(parse!(Expr, ctx), |e| Box::new(e))) >>
     ((body, ret))
 )))),
-|((body, ret), span)| Block {span, body, ret}
-));
+|((body, ret), span)| Block {span, body, ret}));
 
 pub enum Expr<'a>{
     Block(Block<'a>), 
@@ -746,9 +749,21 @@ FromRawAst!(for Module(Module(toplvls), ctx, scp) = {
     Ok(ast::Module { toplvls })
 });
 
+fn align_msg(alignment: usize, msg: &str) -> String {
+    let mut lines = msg.lines();
+    let mut r = lines.next().unwrap().to_string();
+    for line in lines {
+        r.push_str("\n");
+        for _ in 0..alignment { r.push(' '); }
+        r.push_str(line);
+    }
+    r
+}
 
 pub fn format_at_pos<'a, T>(
     span: &LocatedSpan<&'a str, T>,
+    prefix: &str,
+    alignment: usize,
     msg: &str,
     file: &'a File,
     underline: bool,
@@ -761,8 +776,12 @@ pub fn format_at_pos<'a, T>(
 
     let mut buf = String::with_capacity(500);
     {
-        write!(&mut buf, "{}:{}:{}: {}\n", file.path, linum, colnum, msg)?;
+        // Print message
+        write!(&mut buf, "{}:{}:{}: ", file.path, linum, colnum)?;
+        let aligned_msg = align_msg(buf.chars().count() + alignment, msg);
+        write!(&mut buf, "{}{}\n", prefix, aligned_msg)?;
 
+        // Print code preview
         if linecount == 1 {
             write!(&mut buf, "| {}\n", line)?;
             let underline = if underline {
@@ -839,11 +858,9 @@ pub fn run_parser<'a, T: Parsable<'a>>(file: &'a File) -> Result<(T, Symbols<'a>
 
                     Error::msg(format_at_pos(
                         span,
-                        &format!(
-                            "{} expected one of: {}",
-                            Paint::red("error:").bold(),
-                            toks
-                        ),
+                        &Paint::red("error: ").bold().to_string(),
+                        7,
+                        &format!("expected one of: {}", toks),
                         file,
                         false,
                     )?)
