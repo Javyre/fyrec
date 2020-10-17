@@ -16,6 +16,18 @@ impl<'a> Expr<'a> {
     fn get_fun_calls(&self) -> IndexSet<&Rc<Path<'a>>> {
         match self {
             Expr::FunCal(fc) => indexset![&fc.name.path],
+            Expr::If(i) => {
+                let mut r: IndexSet<&Rc<Path>>
+                    = i.clauses.iter().flat_map(|(c, e)| {
+                        let mut r = c.get_fun_calls();
+                        r.extend(e.get_fun_calls());
+                        r
+                    }).collect();
+                if let Some(otherwise) = &i.otherwise {
+                    r.extend(otherwise.get_fun_calls().into_iter());
+                }
+                r
+            },
             Expr::Block(bl) => {
                 let mut r: IndexSet<&Rc<Path>>
                     = bl.body.iter().flat_map(|s| match s {
@@ -58,6 +70,7 @@ pub enum TypeIdent<'a> {
     Function,
     Integer,
     String,
+    Boolean,
     Unit,
 }
 
@@ -67,6 +80,23 @@ pub enum Type<'a> {
     Scheme(Vec<TypeVar>, Box<Type<'a>>),
     Variable(TypeVar),
 }
+
+macro_rules! Type {
+    (@impl $id:expr, $args:expr) => (Type::Concrete($id, $args));
+    ($builtin:ident ( ...$args:expr )) => (
+        Type!(@impl TypeIdent::$builtin, $args)
+    );
+    ($builtin:ident ( $($args:expr),* )) => (
+        Type!(@impl TypeIdent::$builtin, vec![$($args.into()),*])
+    );
+    ([$typeid:expr] ( ...$args:expr )) => (
+        Type!(@impl $typeid, $args)
+    );
+    ([$typeid:expr] ( $($args:expr),* )) => (
+        Type!(@impl $typeid, vec![$($args.into()),*])
+    );
+}
+
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct SubstID(usize);
@@ -82,6 +112,19 @@ pub struct SubstitutionSet<'a> {
 }
 
 #[derive(Debug, Clone)]
+struct IfConstraintCtx<'a> {
+    if_ty: Type<'a>,
+    clause_ty: Type<'a>,
+    last_subst_id: Option<SubstID>,
+}
+
+#[derive(Debug, Clone)]
+struct IfCondConstraintCtx<'a> {
+    cond_ty: Type<'a>,
+    last_subst_id: Option<SubstID>,
+}
+
+#[derive(Debug, Clone)]
 struct FunCalConstraintCtx<'a> {
     fun: Rc<Path<'a>>,
     funty: Type<'a>,
@@ -89,8 +132,15 @@ struct FunCalConstraintCtx<'a> {
     last_subst_id: Option<SubstID>,
 }
 
+// TODO: lift last_subst_id to ConstraintCtx directly
 #[derive(Debug, Clone)]
 pub enum ConstraintCtx<'a> {
+    If {
+        if_: Rc<RefCell<IfConstraintCtx<'a>>>
+    },
+    IfCond {
+        if_cond: Rc<RefCell<IfCondConstraintCtx<'a>>>
+    },
     FunCal {
         fun_cal: Rc<RefCell<FunCalConstraintCtx<'a>>>
     },
@@ -103,11 +153,32 @@ pub enum ConstraintCtx<'a> {
 impl<'a> ConstraintCtx<'a> {
     fn context(&self) -> String {
         match self {
+            ConstraintCtx::If{ if_ } => {
+                let IfConstraintCtx{ if_ty, clause_ty, .. } = &*if_.borrow();
+
+                format!("in if statement. All if clauses should be the same type.
+expected: {}\n     got: {}", if_ty, clause_ty)
+            },
+            ConstraintCtx::IfCond { if_cond } => {
+                let IfCondConstraintCtx{ cond_ty, .. } = &*if_cond.borrow();
+
+                format!("in if statement. If conditions should be boolean expressions.
+expected: {}\n     got: {}", Type!(Boolean()), cond_ty)
+            },
             ConstraintCtx::FunCal{ fun_cal: fc } => {
                 let FunCalConstraintCtx{ fun, funty, calling_funty, .. } = &*fc.borrow();
 
-                format!("in call to {}\nexpected: {}\n     got: {}",
-                        fun, funty, calling_funty)
+                match (&funty, &calling_funty) {
+                    (Type::Concrete(_, aargs), Type::Concrete(_, bargs))
+                        if aargs.len() != bargs.len() => {
+                            format!("in call to {}. Wrong argument count.
+expected: {} arguments\n     got: {} arguments",
+                                    fun, aargs.len()-1, bargs.len()-1)
+                        }
+                    _ =>
+                        format!("in call to {}\nexpected: {}\n     got: {}",
+                                fun, funty, calling_funty)
+                }
             },
             ConstraintCtx::FunCalArg{ n, fun_cal: fc } => {
                 let FunCalConstraintCtx{ fun, funty, calling_funty, .. } = &*fc.borrow();
@@ -121,14 +192,36 @@ impl<'a> ConstraintCtx<'a> {
                         }
                 };
 
-                format!("in param {} in call to {}\nexpected: {}\n     got: {}",
-                        n+1, fun, funty_args[0], calling_funty_args[0])
+                assert_eq!(funty_args.len(), calling_funty_args.len());
+
+                if *n == funty_args.len()-1 {
+                    format!("in return value of call to {}\nexpected: {}\n     got: {}",
+                            fun, calling_funty_args[0], funty_args[0])
+                } else {
+                    format!("in param {} in call to {}\nexpected: {}\n     got: {}",
+                            n+1, fun, funty_args[0], calling_funty_args[0])
+                }
             },
         }
     }
 
     fn substitute(&self, subst: &SubstitutionSet<'a>) {
         match self {
+            ConstraintCtx::If { if_ } => {
+                if if_.borrow().last_subst_id != Some(subst.id) {
+                    let mut refmut = if_.borrow_mut();
+                    refmut.if_ty.substitute(subst);
+                    refmut.clause_ty.substitute(subst);
+                    refmut.last_subst_id = Some(subst.id);
+                }
+            },
+            ConstraintCtx::IfCond { if_cond } => {
+                if if_cond.borrow().last_subst_id != Some(subst.id) {
+                    let mut refmut = if_cond.borrow_mut();
+                    refmut.cond_ty.substitute(subst);
+                    refmut.last_subst_id = Some(subst.id);
+                }
+            },
             ConstraintCtx::FunCal { fun_cal: fc, .. }
             | ConstraintCtx::FunCalArg { fun_cal: fc, .. }
             => {
@@ -245,6 +338,7 @@ impl<'a> fmt::Display for Type<'a> {
                     TypeIdent::Function => write!(f, "FUN")?,
                     TypeIdent::Integer => write!(f, "INT")?,
                     TypeIdent::String => write!(f, "STR")?,
+                    TypeIdent::Boolean => write!(f, "BOO")?,
                     TypeIdent::Unit => write!(f, "NIL")?,
                 }
 
@@ -317,10 +411,14 @@ impl<'a> Constraint<'a> {
     }
 }
 
+#[derive(DebugCustom)]
+#[debug(fmt = "InferContext({}, {}, <ast_types>, <errors>)",
+        next_type_var_id, next_subst_id)]
 struct InferContext<'a> {
     next_type_var_id: usize,
     next_subst_id: usize,
     ast_types: Vec<(AstNodeID, (Type<'a>, Span<'a>))>,
+    errors: IndexSet<String>,
 }
 
 impl<'a> InferContext<'a> {
@@ -329,6 +427,7 @@ impl<'a> InferContext<'a> {
             next_type_var_id: 0,
             next_subst_id: 0,
             ast_types: Vec::with_capacity(100),
+            errors: IndexSet::new(),
         }
     }
 
@@ -438,22 +537,6 @@ macro_rules! with_subscope {
     }
 }
 
-macro_rules! Type {
-    (@impl $id:expr, $args:expr) => (Type::Concrete($id, $args));
-    ($builtin:ident ( ...$args:expr )) => (
-        Type!(@impl TypeIdent::$builtin, $args)
-    );
-    ($builtin:ident ( $($args:expr),* )) => (
-        Type!(@impl TypeIdent::$builtin, vec![$($args.into()),*])
-    );
-    ([$typeid:expr] ( ...$args:expr )) => (
-        Type!(@impl $typeid, $args)
-    );
-    ([$typeid:expr] ( $($args:expr),* )) => (
-        Type!(@impl $typeid, vec![$($args.into()),*])
-    );
-}
-
 macro_rules! Constraint {
     (eq: $a:expr, $b:expr, $s:expr) => {
         Constraint::new_eq($a.into(), $b.into(), $s, None)
@@ -556,6 +639,12 @@ GenConstraints!(for StrLit(this, targ, cons, ctx, _scp) = {
     Ok(())
 });
 
+GenConstraints!(for BooLit(this, targ, cons, ctx, _scp) = {
+    ctx.bind_ast_type(this.get_id(), (targ.into(), this.span()));
+    cons.push(Constraint!(eq: targ, Type!(Boolean()), this.span()));
+    Ok(())
+});
+
 GenConstraints!(for Block(this, targ, cons, ctx, scp) = {
 
     with_subscope!(scp => subscp {
@@ -581,6 +670,55 @@ GenConstraints!(for Block(this, targ, cons, ctx, scp) = {
         ctx.bind_ast_type(this.get_id(), (targ.into(), this.span()));
 
     });
+
+    Ok(())
+});
+
+GenConstraints!(for If(this, targ, cons, ctx, scp) = {
+    let if_ty = if this.otherwise.is_some(){
+        targ
+    } else {
+        cons.push(Constraint!(eq: targ, Type!(Unit()), this.span()));
+        ctx.fresh_tvar()
+    };
+
+    for (cond, clause) in this.clauses.iter() {
+        let cond_ty = ctx.fresh_tvar();
+        let cond_ctx = Rc::new(ConstraintCtx::IfCond {
+            if_cond: Rc::new(RefCell::new(IfCondConstraintCtx{
+                cond_ty: cond_ty.into(),
+                last_subst_id: None
+            }))
+        });
+        cond.gen_constraints(cond_ty, cons, ctx, scp)?;
+        cons.push(Constraint!(eq: cond_ty, Type!(Boolean()),
+                              cond.span(), Some(cond_ctx)));
+
+        let clause_ty = ctx.fresh_tvar();
+        let clause_ctx = Rc::new(ConstraintCtx::If {
+            if_: Rc::new(RefCell::new(IfConstraintCtx{
+                if_ty: if_ty.into(),
+                clause_ty: clause_ty.into(),
+                last_subst_id: None
+            }))
+        });
+        clause.gen_constraints(clause_ty, cons, ctx, scp)?;
+        cons.push(Constraint!(eq: clause_ty, if_ty,
+                              clause.span(), Some(clause_ctx)));
+    }
+    if let Some(clause) = this.otherwise.as_ref() {
+        let clause_ty = ctx.fresh_tvar();
+        let clause_ctx = Rc::new(ConstraintCtx::If {
+            if_: Rc::new(RefCell::new(IfConstraintCtx{
+                if_ty: if_ty.into(),
+                clause_ty: clause_ty.into(),
+                last_subst_id: None
+            }))
+        });
+        clause.gen_constraints(clause_ty, cons, ctx, scp)?;
+        cons.push(Constraint!(eq: clause_ty, if_ty,
+                              clause.span(), Some(clause_ctx)));
+    }
 
     Ok(())
 });
@@ -676,7 +814,7 @@ impl<'a, 'f> FunDefGroup<'a, 'f> {
                 ftys.push(fty);
             }
 
-            let subst = unify(cons.clone(), ctx)?;
+            let subst = unify(cons, ctx);
             ctx.substitute_ast_types(&subst);
             substitute_constraints(cons, &subst);
             subscp.substitute(&subst);
@@ -691,7 +829,7 @@ impl<'a, 'f> FunDefGroup<'a, 'f> {
                                       instance, fundef.span()));
             }
 
-            let subst = unify(cons.clone(), ctx)?;
+            let subst = unify(cons, ctx);
             ctx.substitute_ast_types(&subst);
             substitute_constraints(cons, &subst);
             subscp.substitute(&subst);
@@ -738,10 +876,14 @@ impl<'a> Module<'a> {
 
         // TODO: inference on other ast toplvls (typedefs/structdefs)
 
-        let subst = unify(cons.clone(), &mut ctx)?;
+        let subst = unify(&mut cons, &mut ctx);
         ctx.substitute_ast_types(&subst);
         // substitute_constraints(&mut cons, &subst);
         // scp.substitute(&subst);
+
+        if ctx.errors.len() > 0 {
+            bail!("{}", ctx.errors.into_iter().collect::<Vec<_>>().join("\n"));
+        }
 
         let mut ast_types = IndexMap::with_capacity(ctx.ast_types.len());
         for (id, ty) in ctx.ast_types.into_iter() {
@@ -780,18 +922,40 @@ fn compose_substs<'a>(
     b.id = ctx.fresh_subst_id();
 }
 
+/// Run unify on a copy of the constraints and remove error-causing
+/// constraints from constraint set
 fn unify<'a>(
-    mut cons: Vec<Constraint<'a>>,
+    cons: &mut Vec<Constraint<'a>>,
     ctx: &mut InferContext<'a>,
-) -> Result<SubstitutionSet<'a>> {
+) -> SubstitutionSet<'a> {
+    match unify_impl(cons.clone(), ctx) {
+        Ok(r) => r,
+        Err((r, culprits)) => {
+            for i in dbg!(culprits).into_iter().rev() {
+                cons.remove(i);
+            }
+            r
+        }
+    }
+}
+
+fn unify_impl<'a>(
+    cons: Vec<Constraint<'a>>,
+    ctx: &mut InferContext<'a>,
+) -> Result<SubstitutionSet<'a>, (SubstitutionSet<'a>, IndexSet<usize>)> {
     let mut r = SubstitutionSet{
         subst: IndexMap::with_capacity(cons.len()),
         id: ctx.fresh_subst_id(),
     };
+    let mut errors = vec![];
+    let mut error_culprits = indexset![];
+
+    let mut cons = (0..cons.len()).zip(cons.into_iter()).collect::<Vec<_>>();
 
     let mut i = 0;
     while i < cons.len() {
-        match cons[i].clone() {
+        let culprit = cons[i].0;
+        match cons[i].1.clone() {
             Constraint::Eq{a, b, span, ctx: cons_ctx} => {
                 match (a, b) {
                     (Type::Variable(x), Type::Variable(y)) if x == y => {
@@ -813,7 +977,7 @@ fn unify<'a>(
                             // since it also changes the length of the vec
                             cons[i..len]
                                 .iter_mut()
-                                .for_each(|c| c.substitute(&sub));
+                                .for_each(|c| c.1.substitute(&sub));
 
                             compose_substs(sub, &mut r, ctx);
                         } else {
@@ -821,33 +985,41 @@ fn unify<'a>(
                                 "failed occurs check!",
                                 true,
                             ).unwrap();
-                            bail!("{}", msg);
+                            // bail!("{}", msg);
+                            errors.push(msg);
+                            error_culprits.insert(culprit);
                         }
                     },
 
                     (Type::Concrete(ta, aargs), Type::Concrete(tb, bargs))
                         if ta == tb && aargs.len() == bargs.len() => {
-                            let mut n = 0;
-                            for (a, b) in aargs.into_iter().zip(bargs.into_iter()) {
-                                if let Some(ConstraintCtx::FunCal {fun_cal: fc})
-                                    = cons_ctx.as_ref().map(|c| c.as_ref()) {
+                            if let Some(ConstraintCtx::FunCal {fun_cal: fc})
+                                = cons_ctx.as_ref().map(|c| c.as_ref()) {
+                                    for ((a, b), n) in aargs.into_iter()
+                                        .zip(bargs.into_iter())
+                                        .zip(0..) {
+                                            cons.push(
+                                                (culprit,
+                                                 Constraint!(
+                                                     eq: a, b, span,
+                                                     Some(Rc::new(
+                                                         ConstraintCtx::FunCalArg {
+                                                             n,
+                                                             fun_cal: Rc::clone(&fc),
+                                                         }
+                                                     )))));
+                                        }
+                                } else {
+                                    for (a, b) in aargs.into_iter().zip(bargs.into_iter()) {
                                         cons.push(
-                                            Constraint!(
-                                                eq: a, b, span,
-                                                Some(Rc::new(
-                                                    ConstraintCtx::FunCalArg {
-                                                        n,
-                                                        fun_cal: Rc::clone(&fc),
-                                                    }
-                                                ))));
-                                    } else {
-                                        cons.push(
-                                            Constraint!(
-                                                eq: a, b, span,
-                                                cons_ctx.as_ref().map(|ctx| Rc::clone(ctx))));
+                                            (culprit,
+                                             Constraint!(
+                                                 eq: a, b, span,
+                                                 cons_ctx.as_ref()
+                                                     .map(|ctx| Rc::clone(ctx))
+                                             )));
                                     }
-                                n += 1;
-                            }
+                                }
                         },
 
                     (a, b) if a == b => {
@@ -862,7 +1034,9 @@ fn unify<'a>(
                             ),
                             true,
                         ).unwrap();
-                        bail!("{}", msg);
+                        // bail!("{}", msg);
+                        errors.push(msg);
+                        error_culprits.insert(culprit);
                     },
                 }
             },
@@ -871,7 +1045,13 @@ fn unify<'a>(
         i += 1;
     }
 
-    Ok(r)
+    if errors.len() > 0 {
+        // bail!("{}", errors.join("\n"));
+        ctx.errors.extend(errors);
+        Err((r, error_culprits))
+    } else {
+        Ok(r)
+    }
 }
 
 pub trait FormatAtPos {
@@ -943,8 +1123,10 @@ mod test {
             path: "-".to_string(),
         };
         static ref SPAN: Span<'static> = Span::new_extra(&FILE.prog, &FILE);
-        static ref CTX: InferContext<'static> = InferContext::new();
     }
+
+    #[fixture]
+    fn infer_ctx() -> InferContext<'static> {InferContext::new()}
 
     macro_rules! Constraints {
         [$(($($tt:tt)+)),*$(,)?] => (vec![$(Constraint!($($tt)+, *SPAN)),*]);
@@ -968,7 +1150,7 @@ mod test {
         mut ty: Type<'static>,
         expected: Type<'static>,
     ) {
-        ty.substitute(&SubstitutionSet{ subst: sub, id: 0 });
+        ty.substitute(&SubstitutionSet{ subst: sub, id: SubstID(0) });
         assert_eq!(ty, expected);
     }
 
@@ -1022,13 +1204,18 @@ mod test {
 
              ::trace
     )]
-    fn unify_unifies(
-        constraints: Vec<Constraint>,
-        expected: IndexMap<TypeVar, Type>) {
-        let SubstitutionSet{ subst: unified, ..} = unify(constraints, &mut CTX).unwrap();
+    fn unify_unifies<'a>(
+        mut constraints: Vec<Constraint<'a>>,
+        expected: IndexMap<TypeVar, Type<'a>>,
+        mut infer_ctx: InferContext<'a>,
+    ) {
+        let SubstitutionSet{ subst: unified, ..} = unify(&mut constraints, &mut infer_ctx);
 
         for k in expected.keys() {
             assert_eq!((k, &unified[k]), (k, &expected[k]));
         }
+
+        assert_eq!(infer_ctx.errors.len(), 0);
+        dbg!(infer_ctx.errors);
     }
 }

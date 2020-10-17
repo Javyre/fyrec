@@ -51,6 +51,19 @@ pub struct StrLit<'a> {
     id: AstNodeID,
 }
 #[derive(Debug)]
+pub struct BooLit<'a> {
+    pub span: Span<'a>,
+    pub val: bool,
+    id: AstNodeID,
+}
+#[derive(Debug)]
+pub struct If<'a> {
+    span: Span<'a>,
+    pub clauses: Vec<(Expr<'a>, Expr<'a>)>,
+    pub otherwise: Option<Box<Expr<'a>>>,
+    id: AstNodeID,
+}
+#[derive(Debug)]
 pub struct FunCal<'a> {
     span: Span<'a>,
     pub name: Ident<'a>,
@@ -71,6 +84,8 @@ pub enum Expr<'a> {
     VarRef(VarRef<'a>),
     IntLit(IntLit<'a>),
     StrLit(StrLit<'a>),
+    BooLit(BooLit<'a>),
+    If(If<'a>),
     FunCal(FunCal<'a>),
     Block(Block<'a>),
 }
@@ -183,6 +198,8 @@ IAstNode! { for VarLet as this { get_id: this.id, span: this.span } }
 IAstNode! { for VarRef as this { get_id: this.id, span: this.span } }
 IAstNode! { for IntLit as this { get_id: this.id, span: this.span } }
 IAstNode! { for StrLit as this { get_id: this.id, span: this.span } }
+IAstNode! { for BooLit as this { get_id: this.id, span: this.span } }
+IAstNode! { for If as this { get_id: this.id, span: this.span } }
 IAstNode! { for FunCal as this { get_id: this.id, span: this.span } }
 IAstNode! { for Block  as this { get_id: this.id, span: this.span } }
 IAstNode! { for Rc<FunDef> as this { get_id: this.id, span: this.span } }
@@ -244,6 +261,32 @@ impl<'a> StrLit<'a> {
         Self {
             span,
             val,
+            id: ctx.gen_id(),
+        }
+    }
+}
+
+impl<'a> BooLit<'a> {
+    pub fn new(span: Span<'a>, val: bool, ctx: &mut ParseContext) -> Self {
+        Self {
+            span,
+            val,
+            id: ctx.gen_id(),
+        }
+    }
+}
+
+impl<'a> If<'a> {
+    pub fn new(
+        span: Span<'a>,
+        clauses: Vec<(Expr<'a>, Expr<'a>)>,
+        otherwise: Option<Box<Expr<'a>>>,
+        ctx: &mut ParseContext,
+    ) -> Self {
+        Self {
+            span,
+            clauses,
+            otherwise,
             id: ctx.gen_id(),
         }
     }

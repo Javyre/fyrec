@@ -1,7 +1,8 @@
 use nom::{
-    call, char, complete, delimited, do_parse, escaped_transform, many0,
-    flat_map, map, named, none_of, opt, separated_list, tag, take,
-    take_while_m_n, take_while1, terminated, Err, IResult, parse_to,
+    call, char, complete, delimited, do_parse, escaped_transform,
+    many0, flat_map, map, named, none_of, opt, separated_list,
+    separated_pair, tag, take, take_while_m_n, take_while1,
+    terminated, Err, IResult, parse_to, preceded,
 };
 use nom_locate::LocatedSpan;
 use indexmap::IndexMap;
@@ -399,6 +400,31 @@ Parser!(for StrLit(_ctx) = do_parse!(
         )) >>
         (StrLit(val.1, val.0))));
 
+pub struct BooLit<'a>(Span<'a>, bool);
+Parser!(for BooLit(_ctx) = do_parse!(
+        val: tok!(describe!(
+                "bool",
+                get_span!(alt!(tag!("True") => { |_| true } |
+                               tag!("False") => { |_| false }))
+        )) >>
+        (BooLit(val.1, val.0))));
+
+pub struct If<'a>{
+    span: Span<'a>,
+    clauses: Vec<(Expr<'a>, Expr<'a>)>,
+    otherwise: Option<Box<Expr<'a>>>,
+}
+Parser!(for If(ctx) = map!(tok!(get_span!(do_parse!(
+    tok_tag!("if") >>
+    opt!(tok_tag!("|")) >>
+    clauses: separated_list!(tok_tag!("|"), separated_pair!(parse!(Expr, ctx),
+                                                            tok_tag!(":"),
+                                                            parse!(Expr, ctx))) >>
+    otherwise: opt!(map!(preceded!(tok_tag!("|"), parse!(Expr, ctx)), |o| Box::new(o))) >>
+    (clauses, otherwise)
+))),
+|((clauses, otherwise), span)| If { span, clauses, otherwise }));
+
 pub struct FunCal<'a>{
     span: Span<'a>,
     name: Span<'a>,
@@ -425,16 +451,20 @@ Parser!(for Block(ctx) = map!(tok!(get_span!(braces!(do_parse!(
 
 pub enum Expr<'a>{
     Block(Block<'a>), 
+    If(If<'a>),
     FunCal(FunCal<'a>),
     StrLit(StrLit<'a>),
     IntLit(IntLit<'a>),
+    BooLit(BooLit<'a>),
     VarRef(VarRef<'a>),
 }
 Parser!(for Expr(ctx) = alt!(
         parse!(Block,  ctx) => { |b| Expr::Block(b) }
+      | parse!(If,     ctx) => { |i| Expr::If(i) }
       | parse!(FunCal, ctx) => { |f| Expr::FunCal(f) }
       | parse!(StrLit, ctx) => { |s| Expr::StrLit(s) }
       | parse!(IntLit, ctx) => { |i| Expr::IntLit(i) }
+      | parse!(BooLit, ctx) => { |b| Expr::BooLit(b) }
       | parse!(VarRef, ctx) => { |v| Expr::VarRef(v) }));
 
 pub struct VarLet<'a>{
@@ -571,7 +601,7 @@ macro_rules! DiscoverGlobals {
 }
 
 DiscoverGlobals!(for [
-    VarRef, IntLit, StrLit, FunCal, Block, Expr, VarLet, Stmt
+    VarRef, IntLit, StrLit, BooLit, FunCal, If, Block, Expr, VarLet, Stmt
 ]);
 
 DiscoverGlobals!(for FunDef(FunDef{name, ..}, ctx, scp): Rc = {
@@ -638,6 +668,25 @@ FromRawAst!(for StrLit(StrLit(span, val), ctx, _scp) =
     Ok(ast::StrLit::new(span.into_ast_span(ctx), val, &mut ctx.borrow_mut()))
 );
 
+FromRawAst!(for BooLit(BooLit(span, val), ctx, _scp) =
+    Ok(ast::BooLit::new(span.into_ast_span(ctx), val, &mut ctx.borrow_mut()))
+);
+
+FromRawAst!(for If(If{span, clauses, otherwise}, ctx, scp) = {
+    let span = span.into_ast_span(ctx);
+
+    let clauses = clauses.into_iter()
+        .map(|(c, e)| Ok((from_raw_ast!(Expr, c, ctx, scp)?,
+                          from_raw_ast!(Expr, e, ctx, scp)?)))
+        .collect::<Result<_>>()?;
+
+    let otherwise = otherwise
+        .map(|e| Ok(Box::new(from_raw_ast!(Expr, *e, ctx, scp)?)) as Result<Box<_>>)
+        .transpose()?;
+
+    Ok(ast::If::new(span, clauses, otherwise, &mut ctx.borrow_mut()))
+});
+
 FromRawAst!(for FunCal(FunCal{span, name, args}, ctx, scp) = {
     let span = span.into_ast_span(ctx);
     let ident = {
@@ -670,8 +719,10 @@ FromRawAst!(for Block(Block{span, body, ret}, ctx, scp) = {
 
 FromRawAst!(for Expr(expr, ctx, scp) = Ok(match expr {
     Expr::Block(b)  => ast::Expr::Block(from_raw_ast!(Block, b, ctx, scp)?),
+    Expr::If(i)     => ast::Expr::If(from_raw_ast!(If, i, ctx, scp)?),
     Expr::FunCal(f) => ast::Expr::FunCal(from_raw_ast!(FunCal, f, ctx, scp)?),
     Expr::StrLit(s) => ast::Expr::StrLit(from_raw_ast!(StrLit, s, ctx, scp)?),
+    Expr::BooLit(s) => ast::Expr::BooLit(from_raw_ast!(BooLit, s, ctx, scp)?),
     Expr::IntLit(i) => ast::Expr::IntLit(from_raw_ast!(IntLit, i, ctx, scp)?),
     Expr::VarRef(v) => ast::Expr::VarRef(from_raw_ast!(VarRef, v, ctx, scp)?),
 }));
