@@ -930,8 +930,11 @@ fn unify<'a>(
 ) -> SubstitutionSet<'a> {
     match unify_impl(cons.clone(), ctx) {
         Ok(r) => r,
-        Err((r, culprits)) => {
-            for i in dbg!(culprits).into_iter().rev() {
+        Err((r, mut culprits)) => {
+            culprits.sort_unstable_by(|a, b| b.cmp(a));
+            culprits.dedup();
+
+            for i in dbg!(culprits).into_iter() {
                 cons.remove(i);
             }
             r
@@ -942,13 +945,13 @@ fn unify<'a>(
 fn unify_impl<'a>(
     cons: Vec<Constraint<'a>>,
     ctx: &mut InferContext<'a>,
-) -> Result<SubstitutionSet<'a>, (SubstitutionSet<'a>, IndexSet<usize>)> {
+) -> Result<SubstitutionSet<'a>, (SubstitutionSet<'a>, Vec<usize>)> {
     let mut r = SubstitutionSet{
         subst: IndexMap::with_capacity(cons.len()),
         id: ctx.fresh_subst_id(),
     };
     let mut errors = vec![];
-    let mut error_culprits = indexset![];
+    let mut error_culprits = vec![];
 
     let mut cons = (0..cons.len()).zip(cons.into_iter()).collect::<Vec<_>>();
 
@@ -987,7 +990,7 @@ fn unify_impl<'a>(
                             ).unwrap();
                             // bail!("{}", msg);
                             errors.push(msg);
-                            error_culprits.insert(culprit);
+                            error_culprits.push(culprit);
                         }
                     },
 
@@ -1036,7 +1039,7 @@ fn unify_impl<'a>(
                         ).unwrap();
                         // bail!("{}", msg);
                         errors.push(msg);
-                        error_culprits.insert(culprit);
+                        error_culprits.push(culprit);
                     },
                 }
             },
