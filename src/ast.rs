@@ -99,10 +99,28 @@ pub struct FunDef<'a> {
     id: AstNodeID,
 }
 
+#[derive(Debug)]
+pub struct Type<'a> {
+    span: Span<'a>,
+    pub name: Ident<'a>,
+    pub args: Vec<Type<'a>>,
+    id: AstNodeID,
+}
+
+#[derive(Debug)]
+pub struct StructDef<'a> {
+    span: Span<'a>,
+    pub name: Ident<'a>,
+    pub field_names: Option<Vec<Ident<'a>>>,
+    pub field_types: Vec<Type<'a>>,
+    id: AstNodeID,
+}
+
 #[enum_dispatch]
 #[derive(Debug)]
 pub enum TopLvl<'a> {
     FunDef(Rc<FunDef<'a>>),
+    StructDef(StructDef<'a>),
 }
 
 #[derive(Debug)]
@@ -204,6 +222,8 @@ IAstNode! { for FunCal as this { get_id: this.id, span: this.span } }
 IAstNode! { for Block  as this { get_id: this.id, span: this.span } }
 IAstNode! { for Rc<FunDef> as this { get_id: this.id, span: this.span } }
 // IAstNode! { for FunDef as this { get_id: this.id, span: this.span } }
+IAstNode! { for Type as this { get_id: this.id, span: this.span } }
+IAstNode! { for StructDef as this { get_id: this.id, span: this.span } }
 
 impl<'a> std::fmt::Display for Ident<'a> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -337,6 +357,40 @@ impl<'a> FunDef<'a> {
             name,
             argnames,
             body,
+            id: ctx.gen_id(),
+        }
+    }
+}
+
+impl<'a> Type<'a> {
+    pub fn new(
+        span: Span<'a>,
+        name: Ident<'a>,
+        args: Vec<Type<'a>>,
+        ctx: &mut ParseContext,
+    ) -> Self {
+        Self {
+            span,
+            name,
+            args,
+            id: ctx.gen_id(),
+        }
+    }
+}
+
+impl<'a> StructDef<'a> {
+    pub fn new(
+        span: Span<'a>,
+        name: Ident<'a>,
+        field_names: Option<Vec<Ident<'a>>>,
+        field_types: Vec<Type<'a>>,
+        ctx: &mut ParseContext,
+    ) -> Self {
+        Self {
+            span,
+            name,
+            field_names,
+            field_types,
             id: ctx.gen_id(),
         }
     }

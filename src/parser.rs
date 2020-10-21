@@ -2,7 +2,7 @@ use nom::{
     call, char, complete, delimited, do_parse, escaped_transform,
     many0, flat_map, map, named, none_of, opt, separated_list,
     separated_pair, tag, take, take_while_m_n, take_while1,
-    terminated, Err, IResult, parse_to, preceded,
+    take_while, tuple, terminated, Err, IResult, parse_to, preceded,
 };
 use nom_locate::LocatedSpan;
 use indexmap::IndexMap;
@@ -279,13 +279,13 @@ macro_rules! tok_tag {
 
 macro_rules! parens {
     ($i:expr, $parser:ident!($($args:tt)*)) => {
-        delimited!($i, tok_tag!("("), $parser!($($args)*), tok_tag!(")"))
+        delimited!($i as Span<'a>, tok_tag!("("), $parser!($($args)*), tok_tag!(")"))
     };
 }
 
 macro_rules! braces {
     ($i:expr, $parser:ident!($($args:tt)*)) => {
-        delimited!($i, tok_tag!("{"), $parser!($($args)*), tok_tag!("}"))
+        delimited!($i as Span<'a>, tok_tag!("{"), $parser!($($args)*), tok_tag!("}"))
     };
 }
 
@@ -370,8 +370,18 @@ macro_rules! Parser {
 }
 
 named!(ident(Span) -> Span,
-    tok!(describe!("ident",
-        take_while1!(|c: char| c == '_' || c.is_alphanumeric()))));
+    tok!(describe!("ident", map!(get_span!(tuple!(
+        take_while!(|c: char| c == '_'),
+        take_while1!(|c: char| c.is_lowercase()),
+        take_while!(|c: char| c == '_' || c.is_alphanumeric())
+    )), |(_, s)| s))));
+
+named!(ty_ident(Span) -> Span,
+    tok!(describe!("type ident", map!(get_span!(tuple!(
+        take_while!(|c: char| c == '_'),
+        take_while1!(|c: char| c.is_uppercase()),
+        take_while!(|c: char| c == '_' || c.is_alphanumeric())
+    )), |(_, s)| s))));
 
 pub struct VarRef<'a>(Span<'a>);
 Parser!(for VarRef(_ctx) = map!(call!(ident), |i| VarRef(i)));
@@ -504,13 +514,57 @@ Parser!(for <Rc>FunDef(ctx) = map!(tok!(get_span!(do_parse!(
 ))), 
 |((name, argnames, body), span)| FunDef { span, name, argnames, body } ));
 
+pub struct Type<'a>{
+    span: Span<'a>,
+    name: Span<'a>,
+    args: Vec<Type<'a>>,
+}
+Parser!(for Type(ctx) = map!(tok!(get_span!(do_parse!(
+    name: call!(ty_ident) >>
+    args: many0!(preceded!(tok_tag!("."), alt!(parens!(parse!(Type, ctx)) |
+                                               parse!(Type, ctx)))) >>
+    ((name, args))
+))),
+|((name, args), span)| Type { span, name, args }));
+
+pub struct StructDef<'a> {
+    span: Span<'a>,
+    name: Span<'a>,
+    field_names: Option<Vec<Span<'a>>>,
+    field_types: Vec<Type<'a>>,
+}
+Parser!(for StructDef(ctx) = map!(tok!(get_span!(do_parse!(
+    tok_tag!("struct") >>
+    name: call!(ty_ident) >>
+    fields: alt!(
+        braces!(separated_list!(tok_tag!(","),
+                                tuple!(call!(ident), tok_tag!("::"), parse!(Type, ctx)))
+        ) => {|fields|{
+            let mut fnames = Vec::with_capacity(fields.len());
+            let mut ftypes = Vec::with_capacity(fields.len());
+            for (fname, _, ftype) in fields.into_iter() {
+                fnames.push(fname);
+                ftypes.push(ftype);
+            }
+            (Some(fnames), ftypes)
+        }} |
+        parens!(separated_list!(tok_tag!(","), parse!(Type, ctx))) => {|fts|(None, fts)}
+    ) >>
+    ((name, fields.0, fields.1))
+))),
+|((name, field_names, field_types), span)| StructDef {
+    span, name, field_names, field_types
+}));
+
 pub enum TopLvl<'a>{
+    StructDef(StructDef<'a>),
     FunDef(FunDef<'a>),
 }
 Parser!(for TopLvl(ctx) =
     terminated!(
         alt!(
-            parse!(Rc<FunDef>, ctx) => { |fd| TopLvl::FunDef(fd) }
+            parse!(Rc<FunDef>, ctx) => { |fd| TopLvl::FunDef(fd) } |
+            parse!(StructDef, ctx) => { |sd| TopLvl::StructDef(sd) }
         ), 
         tok_tag!(";")));
 
@@ -601,7 +655,7 @@ macro_rules! DiscoverGlobals {
 }
 
 DiscoverGlobals!(for [
-    VarRef, IntLit, StrLit, BooLit, FunCal, If, Block, Expr, VarLet, Stmt
+    VarRef, IntLit, StrLit, BooLit, FunCal, If, Block, Expr, VarLet, Stmt, Type
 ]);
 
 DiscoverGlobals!(for FunDef(FunDef{name, ..}, ctx, scp): Rc = {
@@ -611,9 +665,17 @@ DiscoverGlobals!(for FunDef(FunDef{name, ..}, ctx, scp): Rc = {
     Ok(())
 });
 
+DiscoverGlobals!(for StructDef(StructDef{name, ..}, ctx, scp) = {
+    let name = name.clone().into_ast_span(ctx);
+    let path = ctx.borrow_mut().mk_path(name);
+    scp.borrow_mut().bind(&name, Rc::clone(&path));
+    Ok(())
+});
+
 DiscoverGlobals!(for TopLvl(toplvl, ctx, scp) = {
     match toplvl {
         TopLvl::FunDef(fd) => discover_globals!(Rc<FunDef>, fd, ctx, scp),
+        TopLvl::StructDef(sd) => discover_globals!(StructDef, sd, ctx, scp),
     }?;
     Ok(())
 });
@@ -782,14 +844,53 @@ FromRawAst!(for FunDef(FunDef{span, name, argnames, body}, ctx, scp): Rc = {
         Rc::new(ast::FunDef::new(span, ident, argnames, body, &mut ctx));
 
     scp.borrow_mut().bind(&name, Rc::clone(&path));
-        ctx.insert_fundef(path, Rc::clone(&fundef));
+    ctx.insert_fundef(path, Rc::clone(&fundef));
 
     Ok(fundef)
+});
+
+FromRawAst!(for Type(Type{span, name, args}, ctx, scp) = {
+    let span = span.into_ast_span(ctx);
+    let path = Rc::clone(scp.borrow().try_get(&name, &ctx.borrow())?);
+    let name = name.into_ast_span(ctx);
+    let ident = Ident::new(Rc::clone(&path), name);
+
+    let args = args
+        .into_iter()
+        .map(|a| Ok(from_raw_ast!(Type, a, ctx, scp)?))
+        .collect::<Result<Vec<_>>>()?;
+
+    let mut ctx = ctx.borrow_mut();
+
+    Ok(ast::Type::new(span, ident, args, &mut ctx))
+});
+
+FromRawAst!(for StructDef(StructDef{span, name, field_names, field_types}, ctx, scp) = {
+    let span = span.into_ast_span(ctx);
+    let path = Rc::clone(scp.borrow().try_get(&name, &ctx.borrow())?);
+    let name = name.into_ast_span(ctx);
+    let ident = Ident::new(Rc::clone(&path), name);
+
+    let field_names = field_names.map(|fns| fns.into_iter().map(|name|{
+        let name = name.into_ast_span(ctx);
+        Ident::new(Rc::clone(&path), name)
+    }).collect());
+
+    let field_types = field_types
+        .into_iter()
+        .map(|ty| Ok(from_raw_ast!(Type, ty, ctx, scp)?))
+        .collect::<Result<Vec<_>>>()?;
+
+    let mut ctx = ctx.borrow_mut();
+
+    Ok(ast::StructDef::new(span, ident, field_names, field_types, &mut ctx))
 });
 
 FromRawAst!(for TopLvl(toplvl, ctx, scp) = Ok(match toplvl {
     TopLvl::FunDef(fd) => 
         ast::TopLvl::FunDef(from_raw_ast!(Rc<FunDef>, fd, ctx, scp)?),
+    TopLvl::StructDef(sd) =>
+        ast::TopLvl::StructDef(from_raw_ast!(StructDef, sd, ctx, scp)?),
 }));
 
 FromRawAst!(for Module(Module(toplvls), ctx, scp) = {
