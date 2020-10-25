@@ -16,6 +16,7 @@ use std::fmt::Write;
 use std::rc::Rc;
 
 use crate::ast;
+use crate::infer;
 use crate::ast::{ Ident, AstNodeID };
 use ast::Symbols;
 
@@ -156,13 +157,19 @@ impl<'a, 'sym> ParseContext<'a, 'sym> {
         &self.current_path
     }
     pub fn mk_path<E>(&mut self, part: LocatedSpan<&'a str, E>) -> Rc<Path<'a>> {
+        self.mk_path_raw(part.fragment())
+    }
+    pub fn mk_path_raw(&mut self, part: &'a str) -> Rc<Path<'a>> {
         let mut path = self.current_path.clone();
-        path.push(part.fragment());
+        path.push(part);
         path.make_unique(self);
         Rc::new(path)
     }
     pub fn insert_fundef(&mut self, path: Rc<Path<'a>>, node: Rc<ast::FunDef<'a>>) {
         self.symbols.fundefs.insert(path, node);
+    }
+    pub fn insert_type(&mut self, path: Rc<Path<'a>>, ty: infer::Type<'a>) {
+        self.symbols.types.insert(path, ty);
     }
 }
 
@@ -305,9 +312,9 @@ macro_rules! describe {
 // the function version of alt properly `or`s errors together
 macro_rules! alt {
     (@parser $parser:ident!($($args:tt)*) => $map:expr) =>
-        (|i| map!(i, $parser!($($args)*), $map));
+        (|i| map!(i as Span, $parser!($($args)*), $map));
     (@parser $parser:ident!($($args:tt)*)) =>
-        (|i| $parser!(i, $($args)*));
+        (|i| $parser!(i as Span, $($args)*));
 
     ($i:expr, $parser:ident!($($args:tt)*) $(=> { $map:expr })?) => (
         alt!(@parser $parser!($($args)*) $(=> $map)?)($i)
@@ -377,10 +384,13 @@ named!(ident(Span) -> Span,
     )), |(_, s)| s))));
 
 named!(ty_ident(Span) -> Span,
-    tok!(describe!("type ident", map!(get_span!(tuple!(
-        take_while!(|c: char| c == '_'),
-        take_while1!(|c: char| c.is_uppercase()),
-        take_while!(|c: char| c == '_' || c.is_alphanumeric())
+    tok!(describe!("type ident", map!(get_span!(alt!(
+        tuple!(
+            take_while!(|c: char| c == '_'),
+            take_while1!(|c: char| c.is_uppercase()),
+            take_while!(|c: char| c == '_' || c.is_alphanumeric())
+        ) => {|_| ()} |
+        tok_tag!("()") => {|_| ()}
     )), |(_, s)| s))));
 
 pub struct VarRef<'a>(Span<'a>);
@@ -618,7 +628,10 @@ impl<'a, 'p> Scope<'a, 'p> {
     }
 
     fn bind<E>(&mut self, id: &LocatedSpan<&'a str, E>, path: Rc<Path<'a>>) {
-        self.scope.insert(id.fragment(), path);
+        self.bind_raw(id.fragment(), path);
+    }
+    fn bind_raw(&mut self, id: &'a str, path: Rc<Path<'a>>) {
+        self.scope.insert(id, path);
     }
 }
 
@@ -685,6 +698,30 @@ DiscoverGlobals!(for Module(Module(toplvls), ctx, scp) =
         .map(|tl| discover_globals!(TopLvl, tl, ctx, scp))
         .collect::<Result<()>>()
 );
+
+fn bind_builtin_type_ident<'a, 'scp, 'sym>(
+    ident: &'static str,
+    ty: infer::TypeIdent<'a>,
+    ctx: &mut ParseContext<'a, 'sym>,
+    scp: &mut Scope<'a, 'scp>,
+) {
+    let path = ctx.mk_path_raw(ident);
+    scp.bind_raw(ident, Rc::clone(&path));
+    ctx.insert_type(path, infer::Type::Concrete(ty, vec![]));
+}
+
+fn bind_builtins<'a, 'scp, 'sym>(
+    ctx: &RefCell<ParseContext<'a, 'sym>>,
+    scp: &RefCell<Scope<'a, 'scp>>,
+) {
+    let ctx = &mut ctx.borrow_mut();
+    let scp = &mut scp.borrow_mut();
+
+    bind_builtin_type_ident("Int", infer::TypeIdent::Integer, ctx, scp);
+    bind_builtin_type_ident("Str", infer::TypeIdent::String, ctx, scp);
+    bind_builtin_type_ident("Bool", infer::TypeIdent::Boolean, ctx, scp);
+    bind_builtin_type_ident("()", infer::TypeIdent::Unit, ctx, scp);
+}
 
 trait FromRawAst<'a, Raw>: Sized {
     fn from_raw_ast<'scp, 'sym>(
@@ -983,6 +1020,8 @@ pub fn run_parser<'a, T: Parsable<'a>>(file: &'a File) -> Result<(T, Symbols<'a>
     let tracker = ErrorTrackerRef(Rc::new(RefCell::new(ErrorTracker::new())));
     let ctx = RefCell::new(ParseContext::new(file, &mut symbols));
     let scp = RefCell::new(Scope::new());
+
+    bind_builtins(&ctx, &scp);
 
     match T::parse(
         Span::new_extra(&file.prog, tracker.clone()), &ctx

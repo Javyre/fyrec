@@ -1,4 +1,5 @@
 use crate::parser::{ ParseContext, File, Path };
+use crate::infer;
 use enum_dispatch::enum_dispatch;
 
 use indexmap::IndexMap;
@@ -9,6 +10,7 @@ pub type Span<'a> = LocatedSpan<&'a str, &'a File>;
 
 pub struct Symbols<'a> {
     pub fundefs: IndexMap<Rc<Path<'a>>, Rc<FunDef<'a>>>,
+    pub types: IndexMap<Rc<Path<'a>>, infer::Type<'a>>,
 }
 
 #[derive(Debug, Clone)]
@@ -157,7 +159,10 @@ pub trait IExpr {}
 impl<'a> Debug for Symbols<'a> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         for (k, v) in self.fundefs.iter() {
-            writeln!(f, "{:?}: {},", k, v.get_id())?;
+            writeln!(f, "{:?}: node-{},", k, v.get_id())?;
+        }
+        for (k, v) in self.types.iter() {
+            writeln!(f, "{:?}: {:?},", k, v)?;
         }
         Ok(())
     }
@@ -180,6 +185,7 @@ impl<'a> Symbols<'a> {
     pub fn new() -> Self {
         Self {
             fundefs: IndexMap::new(),
+            types: IndexMap::new(),
         }
     }
 }
