@@ -1,15 +1,18 @@
 use crate::parser::{ ParseContext, File, Path };
 use crate::infer;
+use crate::infer::TvarGen;
 use enum_dispatch::enum_dispatch;
 
 use indexmap::IndexMap;
 use nom_locate::LocatedSpan;
+use anyhow::{Result, bail};
 use std::{fmt::Debug, rc::Rc};
 
 pub type Span<'a> = LocatedSpan<&'a str, &'a File>;
 
 pub struct Symbols<'a> {
     pub fundefs: IndexMap<Rc<Path<'a>>, Rc<FunDef<'a>>>,
+    pub structdefs: IndexMap<Rc<Path<'a>>, Rc<StructDef<'a>>>,
     pub types: IndexMap<Rc<Path<'a>>, infer::Type<'a>>,
 }
 
@@ -59,6 +62,18 @@ pub struct BooLit<'a> {
     id: AstNodeID,
 }
 #[derive(Debug)]
+pub enum StructLitFields<'a> {
+    Named(IndexMap<&'a str, (Span<'a>, Expr<'a>)>),
+    UnNamed(Vec<Expr<'a>>),
+}
+#[derive(Debug)]
+pub struct StructLit<'a> {
+    span: Span<'a>,
+    pub name: Ident<'a>,
+    pub fields: StructLitFields<'a>,
+    id: AstNodeID,
+}
+#[derive(Debug)]
 pub struct If<'a> {
     span: Span<'a>,
     pub clauses: Vec<(Expr<'a>, Expr<'a>)>,
@@ -87,6 +102,7 @@ pub enum Expr<'a> {
     IntLit(IntLit<'a>),
     StrLit(StrLit<'a>),
     BooLit(BooLit<'a>),
+    StructLit(StructLit<'a>),
     If(If<'a>),
     FunCal(FunCal<'a>),
     Block(Block<'a>),
@@ -185,6 +201,7 @@ impl<'a> Symbols<'a> {
     pub fn new() -> Self {
         Self {
             fundefs: IndexMap::new(),
+            structdefs: IndexMap::new(),
             types: IndexMap::new(),
         }
     }
@@ -223,6 +240,7 @@ IAstNode! { for VarRef as this { get_id: this.id, span: this.span } }
 IAstNode! { for IntLit as this { get_id: this.id, span: this.span } }
 IAstNode! { for StrLit as this { get_id: this.id, span: this.span } }
 IAstNode! { for BooLit as this { get_id: this.id, span: this.span } }
+IAstNode! { for StructLit as this { get_id: this.id, span: this.span } }
 IAstNode! { for If as this { get_id: this.id, span: this.span } }
 IAstNode! { for FunCal as this { get_id: this.id, span: this.span } }
 IAstNode! { for Block  as this { get_id: this.id, span: this.span } }
@@ -297,6 +315,22 @@ impl<'a> BooLit<'a> {
         Self {
             span,
             val,
+            id: ctx.gen_id(),
+        }
+    }
+}
+
+impl<'a> StructLit<'a> {
+    pub fn new(
+        span: Span<'a>,
+        name: Ident<'a>,
+        fields: StructLitFields<'a>,
+        ctx: &mut ParseContext
+    ) -> Self {
+        Self {
+            span,
+            name,
+            fields,
             id: ctx.gen_id(),
         }
     }
@@ -380,6 +414,30 @@ impl<'a> Type<'a> {
             name,
             args,
             id: ctx.gen_id(),
+        }
+    }
+    pub fn to_type<'s>(&self, ctx: &mut ParseContext<'a, 's>) -> Result<infer::Type<'a>> {
+        match ctx.get_type(&self.name.path)?.clone() {
+            infer::Type::Scheme(params, mut body) => {
+                if self.args.len() == params.len() {
+                    let subst = params.iter()
+                        .zip(self.args.iter().map(|a|a.to_type(ctx)))
+                        .map(|(k, v)| Ok((*k, v?)))
+                        .collect::<Result<IndexMap<_, _>>>()?;
+
+                    body.substitute(&infer::SubstitutionSet{subst, id: infer::SubstID(0)});
+                    Ok(*body)
+                } else {
+                    bail!("Argument count mismatch in reference to type")
+                }
+            },
+            ty => {
+                if self.args.len() == 0 {
+                    Ok(ty)
+                } else {
+                    bail!("Argument count mismatch in reference to type")
+                }
+            }
         }
     }
 }

@@ -96,7 +96,7 @@ impl<'a, 's> FormatAtPos<'a, 's> for Span<'a> {
 }
 
 #[derive(Display, Debug, Clone, Hash, Eq, PartialEq)]
-#[display(fmt = "{}.{}", "path.join(\":\")", id)]
+#[display(fmt = "{}/{}", "path.join(\":\")", id)]
 pub struct Path<'a> {
     path: Vec<&'a str>,
     id: usize, // shadowing variables share the same path but different id
@@ -120,6 +120,7 @@ impl<'a> Path<'a> {
 
 #[derive(Debug)]
 pub struct ParseContext<'a, 'sym> {
+    tvar_gen: infer::TvarGenerator,
     next_path_id: usize,
     next_node_id: usize,
     current_path: Path<'a>,
@@ -128,8 +129,13 @@ pub struct ParseContext<'a, 'sym> {
 }
 
 impl<'a, 'sym> ParseContext<'a, 'sym> {
-    pub fn new(file: &'a File, symbols: &'sym mut Symbols<'a>) -> Self {
+    pub fn new(
+        file: &'a File,
+        symbols: &'sym mut Symbols<'a>,
+        tvs: infer::TvarGenerator
+    ) -> Self {
         Self {
+            tvar_gen: tvs,
             current_path: Path::empty_with_id(0),
             next_node_id: 0,
             next_path_id: 1,
@@ -170,6 +176,15 @@ impl<'a, 'sym> ParseContext<'a, 'sym> {
     }
     pub fn insert_type(&mut self, path: Rc<Path<'a>>, ty: infer::Type<'a>) {
         self.symbols.types.insert(path, ty);
+    }
+    pub fn get_type(&self, path: &Rc<Path<'a>>) -> Result<&infer::Type<'a>> {
+        self.symbols.types.get(path).context("type not found in type registry")
+    }
+}
+
+impl<'a, 'sym> infer::TvarGen for ParseContext<'a, 'sym> {
+    fn fresh_tvar(&mut self) -> infer::TypeVar {
+        self.tvar_gen.fresh_tvar()
     }
 }
 
@@ -429,6 +444,35 @@ Parser!(for BooLit(_ctx) = do_parse!(
         )) >>
         (BooLit(val.1, val.0))));
 
+pub enum StructLitFields<'a>{
+    Named(Vec<(Span<'a>, Expr<'a>)>),
+    UnNamed(Vec<Expr<'a>>),
+}
+pub struct StructLit<'a>{
+    span: Span<'a>,
+    name: Span<'a>,
+    fields: StructLitFields<'a>,
+}
+Parser!(for StructLit(ctx) = map!(tok!(get_span!(do_parse!(
+    name: call!(ty_ident) >>
+    fields: alt!(
+        parens!(separated_list!(tok_tag!(","), parse!(Expr, ctx))) => {
+            |fields| StructLitFields::UnNamed(fields)
+        } |
+        braces!(separated_list!(tok_tag!(","),
+                                tuple!(
+                                    call!(ident),
+                                    tok_tag!(":"),
+                                    parse!(Expr, ctx)))) => {
+            |fields| StructLitFields::Named(
+                fields.into_iter().map(|(n, _, e)| (n, e)).collect()
+            )
+        }
+    ) >>
+    ((name, fields))
+))),
+|((name, fields), span)| StructLit { span, name, fields }));
+
 pub struct If<'a>{
     span: Span<'a>,
     clauses: Vec<(Expr<'a>, Expr<'a>)>,
@@ -473,19 +517,21 @@ pub enum Expr<'a>{
     Block(Block<'a>), 
     If(If<'a>),
     FunCal(FunCal<'a>),
+    StructLit(StructLit<'a>),
     StrLit(StrLit<'a>),
     IntLit(IntLit<'a>),
     BooLit(BooLit<'a>),
     VarRef(VarRef<'a>),
 }
 Parser!(for Expr(ctx) = alt!(
-        parse!(Block,  ctx) => { |b| Expr::Block(b) }
-      | parse!(If,     ctx) => { |i| Expr::If(i) }
-      | parse!(FunCal, ctx) => { |f| Expr::FunCal(f) }
-      | parse!(StrLit, ctx) => { |s| Expr::StrLit(s) }
-      | parse!(IntLit, ctx) => { |i| Expr::IntLit(i) }
-      | parse!(BooLit, ctx) => { |b| Expr::BooLit(b) }
-      | parse!(VarRef, ctx) => { |v| Expr::VarRef(v) }));
+        parse!(Block,     ctx) => { |b| Expr::Block(b) }
+      | parse!(If,        ctx) => { |i| Expr::If(i) }
+      | parse!(FunCal,    ctx) => { |f| Expr::FunCal(f) }
+      | parse!(StructLit, ctx) => { |s| Expr::StructLit(s) }
+      | parse!(StrLit,    ctx) => { |s| Expr::StrLit(s) }
+      | parse!(IntLit,    ctx) => { |i| Expr::IntLit(i) }
+      | parse!(BooLit,    ctx) => { |b| Expr::BooLit(b) }
+      | parse!(VarRef,    ctx) => { |v| Expr::VarRef(v) }));
 
 pub struct VarLet<'a>{
     span: Span<'a>, 
@@ -668,7 +714,7 @@ macro_rules! DiscoverGlobals {
 }
 
 DiscoverGlobals!(for [
-    VarRef, IntLit, StrLit, BooLit, FunCal, If, Block, Expr, VarLet, Stmt, Type
+    VarRef, IntLit, StrLit, StructLit, BooLit, FunCal, If, Block, Expr, VarLet, Stmt, Type
 ]);
 
 DiscoverGlobals!(for FunDef(FunDef{name, ..}, ctx, scp): Rc = {
@@ -771,6 +817,35 @@ FromRawAst!(for BooLit(BooLit(span, val), ctx, _scp) =
     Ok(ast::BooLit::new(span.into_ast_span(ctx), val, &mut ctx.borrow_mut()))
 );
 
+FromRawAst!(for StructLit(StructLit{span, name, fields}, ctx, scp) = {
+    let ident = {
+        let scp = scp.borrow();
+        let path = scp.try_get(&name, &ctx.borrow())?;
+        Ident::new(Rc::clone(path), name.into_ast_span(ctx))
+    };
+
+    let fields = match fields {
+        StructLitFields::Named(vec) => {
+            let mut map = IndexMap::with_capacity(vec.len());
+            for (name, expr) in vec.into_iter() {
+                let name = name.into_ast_span(ctx);
+                map.insert(*name.fragment(),
+                            (name, from_raw_ast!(Expr, expr, ctx, scp)?));
+            }
+            ast::StructLitFields::Named(map)
+        },
+        StructLitFields::UnNamed(exprs) => {
+            let exprs = exprs
+                .into_iter()
+                .map(|e| from_raw_ast!(Expr, e, ctx, scp))
+                .collect::<Result<Vec<_>>>()?;
+            ast::StructLitFields::UnNamed(exprs)
+        }
+    };
+
+    Ok(ast::StructLit::new(span.into_ast_span(ctx), ident, fields, &mut ctx.borrow_mut()))
+});
+
 FromRawAst!(for If(If{span, clauses, otherwise}, ctx, scp) = {
     let span = span.into_ast_span(ctx);
 
@@ -817,13 +892,14 @@ FromRawAst!(for Block(Block{span, body, ret}, ctx, scp) = {
 });
 
 FromRawAst!(for Expr(expr, ctx, scp) = Ok(match expr {
-    Expr::Block(b)  => ast::Expr::Block(from_raw_ast!(Block, b, ctx, scp)?),
-    Expr::If(i)     => ast::Expr::If(from_raw_ast!(If, i, ctx, scp)?),
-    Expr::FunCal(f) => ast::Expr::FunCal(from_raw_ast!(FunCal, f, ctx, scp)?),
-    Expr::StrLit(s) => ast::Expr::StrLit(from_raw_ast!(StrLit, s, ctx, scp)?),
-    Expr::BooLit(s) => ast::Expr::BooLit(from_raw_ast!(BooLit, s, ctx, scp)?),
-    Expr::IntLit(i) => ast::Expr::IntLit(from_raw_ast!(IntLit, i, ctx, scp)?),
-    Expr::VarRef(v) => ast::Expr::VarRef(from_raw_ast!(VarRef, v, ctx, scp)?),
+    Expr::Block(b)     => ast::Expr::Block(from_raw_ast!(Block, b, ctx, scp)?),
+    Expr::If(i)        => ast::Expr::If(from_raw_ast!(If, i, ctx, scp)?),
+    Expr::FunCal(f)    => ast::Expr::FunCal(from_raw_ast!(FunCal, f, ctx, scp)?),
+    Expr::StructLit(s) => ast::Expr::StructLit(from_raw_ast!(StructLit, s, ctx, scp)?),
+    Expr::StrLit(s)    => ast::Expr::StrLit(from_raw_ast!(StrLit, s, ctx, scp)?),
+    Expr::BooLit(s)    => ast::Expr::BooLit(from_raw_ast!(BooLit, s, ctx, scp)?),
+    Expr::IntLit(i)    => ast::Expr::IntLit(from_raw_ast!(IntLit, i, ctx, scp)?),
+    Expr::VarRef(v)    => ast::Expr::VarRef(from_raw_ast!(VarRef, v, ctx, scp)?),
 }));
 
 FromRawAst!(for VarLet(VarLet{span, var, val}, ctx, scp) = {
@@ -908,10 +984,11 @@ FromRawAst!(for StructDef(StructDef{span, name, field_names, field_types}, ctx, 
     let name = name.into_ast_span(ctx);
     let ident = Ident::new(Rc::clone(&path), name);
 
-    let field_names = field_names.map(|fns| fns.into_iter().map(|name|{
-        let name = name.into_ast_span(ctx);
-        Ident::new(Rc::clone(&path), name)
-    }).collect());
+    let field_names: Option<Vec<Ident<'a>>> = field_names
+        .map(|fns| fns.into_iter().map(|name|{
+            let name = name.into_ast_span(ctx);
+            Ident::new(Rc::clone(&path), name)
+        }).collect());
 
     let field_types = field_types
         .into_iter()
@@ -919,6 +996,24 @@ FromRawAst!(for StructDef(StructDef{span, name, field_names, field_types}, ctx, 
         .collect::<Result<Vec<_>>>()?;
 
     let mut ctx = ctx.borrow_mut();
+
+    let record = infer::Type::Record(
+        infer::TypeIdent::User(Rc::clone(&path)),
+        if let Some(field_names) = field_names.as_ref() {
+            field_names.iter()
+                .map(|n|infer::RowIndex::Label(n.span.fragment()))
+                .zip(field_types.iter().map(|ty| ty.to_type(&mut ctx)))
+                .map(|(n, t)|Ok((n, t?)))
+                .collect::<Result<IndexMap<_, _>>>()?
+        } else {
+            (0..)
+                .map(|i|infer::RowIndex::Index(i))
+                .zip(field_types.iter().map(|ty| ty.to_type(&mut ctx)))
+                .map(|(n, t)|Ok((n, t?)))
+                .collect::<Result<IndexMap<_, _>>>()?
+        }
+    );
+    ctx.insert_type(path, infer::Type::Scheme(vec![], Box::new(record)));
 
     Ok(ast::StructDef::new(span, ident, field_names, field_types, &mut ctx))
 });
@@ -1015,10 +1110,14 @@ pub fn format_at_pos<'a, T>(
     Ok(buf)
 }
 
-pub fn run_parser<'a, T: Parsable<'a>>(file: &'a File) -> Result<(T, Symbols<'a>)> {
+pub fn run_parser<'a, T: Parsable<'a>>(
+    file: &'a File
+) -> Result<(T, Symbols<'a>, infer::TvarGenerator)> {
+
+    let tvar_gen = infer::TvarGenerator::new();
     let mut symbols = Symbols::new();
     let tracker = ErrorTrackerRef(Rc::new(RefCell::new(ErrorTracker::new())));
-    let ctx = RefCell::new(ParseContext::new(file, &mut symbols));
+    let ctx = RefCell::new(ParseContext::new(file, &mut symbols, tvar_gen));
     let scp = RefCell::new(Scope::new());
 
     bind_builtins(&ctx, &scp);
@@ -1062,6 +1161,9 @@ pub fn run_parser<'a, T: Parsable<'a>>(file: &'a File) -> Result<(T, Symbols<'a>
             };
             Err(errmsg)
         }
-        Ok(r) => Ok((r?, symbols)),
+        Ok(r) => Ok({
+            let tvs = ctx.into_inner().tvar_gen;
+            (r?, symbols, tvs)
+        }),
     }
 }

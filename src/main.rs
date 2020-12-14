@@ -39,7 +39,7 @@ a(x) = { a(1); a(x); x };
         path: "-".to_string(),
     };
 
-    let (module, symbols) = run_parser::<ast::Module>(&test_file)
+    let (module, symbols, tvs) = run_parser::<ast::Module>(&test_file)
         .context("Failed to parse file")?;
 
     println!("FunDefs:");
@@ -47,7 +47,7 @@ a(x) = { a(1); a(x); x };
         println!("\t{}", path);
     }
 
-    let types = module.gen_constraints(&symbols)
+    let types = module.gen_constraints(&symbols, tvs)
         .context("Failed to infer type constraints")?;
 
     for (_nodeid, (ty, span)) in types {
