@@ -222,6 +222,7 @@ expected: {} arguments\n     got: {} arguments",
                 }
             },
             ConstraintCtx::FunCalArg{ n, fun_cal: fc } => {
+                let n = *n;
                 let FunCalConstraintCtx{ fun, funty, calling_funty, .. } = &*fc.borrow();
                 let (funty_args, calling_funty_args) = {
                     if let (Type::Concrete(TypeIdent::Function, funty_args),
@@ -235,12 +236,12 @@ expected: {} arguments\n     got: {} arguments",
 
                 assert_eq!(funty_args.len(), calling_funty_args.len());
 
-                if *n == funty_args.len()-1 {
+                if n == funty_args.len()-1 {
                     format!("in return value of call to {}\nexpected: {}\n     got: {}",
-                            fun, calling_funty_args[0], funty_args[0])
+                            fun, calling_funty_args[n], funty_args[n])
                 } else {
                     format!("in param {} in call to {}\nexpected: {}\n     got: {}",
-                            n+1, fun, funty_args[0], calling_funty_args[0])
+                            n+1, fun, funty_args[n], calling_funty_args[n])
                 }
             },
             ConstraintCtx::StructLitField{ struct_field: sf } => {
