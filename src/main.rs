@@ -5,6 +5,8 @@ extern crate nom_locate;
 extern crate yansi;
 extern crate bitflags;
 extern crate indexmap;
+extern crate vecshard;
+extern crate itertools;
 extern crate pretty_env_logger;
 #[macro_use] extern crate log;
 
@@ -33,8 +35,22 @@ fn try_main() -> Result<()> {
 
     let test_file = parser::File {
         prog: "
-b(x) = a(\"12l3\");
-a(x) = { a(1); a(x); x };
+struct Foo {index :: Int};
+struct First {index :: Int, other :: Bool};
+struct Second(Int, ());
+
+infix right 2 +;
+infix left 1 -;
+
+`+`(a, b) = a;
+`-`(a, b) = b;
+
+id(x) = if
+    | True: Second(x - 1, {})
+    | c(x): Second(123, {})
+    | Second(9, {});
+
+c(x) = False;
         ".to_string(),
         path: "-".to_string(),
     };
@@ -47,7 +63,8 @@ a(x) = { a(1); a(x); x };
         println!("\t{}", path);
     }
 
-    let types = module.gen_constraints(&symbols, tvs)
+    let types = module
+        .gen_constraints(&symbols, tvs)
         .context("Failed to infer type constraints")?;
 
     for (_nodeid, (ty, span)) in types {

@@ -8,13 +8,15 @@ edition = "2018"
 nom = "5.1.1"
 nom_locate = "2.0.0"
 yansi = "0.5.0"
-enum_dispatch = "0.3.0"
+enum_dispatch = "0.3.0" # TODO: get rid of this
 anyhow = "1.0.31"
 bitflags = "1.2.1"
 indexmap = "1.5.1"
+vecshard = "0.2.1"
+itertools = "0.10.0"
 derive_more = "0.99.9"
 log = "0.4"
-pretty_env_logger = "0.4.0"
+pretty_env_logger = "0.4.0" # TODO: get rid of this
 
 [dev-dependencies]
 rstest = "0.6.4"
